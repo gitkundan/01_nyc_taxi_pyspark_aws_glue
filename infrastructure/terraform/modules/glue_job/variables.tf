@@ -1,0 +1,17 @@
+variable "name_prefix" { type = string }
+variable "tags" { type = map(string) }
+variable "data_bucket_prefix" { type = string }
+variable "code_bucket_prefix" { type = string }
+variable "script_location_bronze" { type = string }
+variable "vpc_id" { type = string }
+variable "subnet_id" { type = string }
+variable "egress_cidr_block" { type = string }
+variable "script_source_path" { type = string }
+variable "code_bucket_name" { type = string }
+variable "script_s3_key" { type = string }
+variable "bronze_bucket_name" { type = string }
+variable "silver_bucket_name" { type = string }
+variable "input_key" { type = string }
+variable "output_prefix" { type = string }
+variable "db_name" { type = string }
+variable "table_name" { type = string }
