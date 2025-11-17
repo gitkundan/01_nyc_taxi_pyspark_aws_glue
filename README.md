@@ -11,9 +11,9 @@ Confirm identity: aws sts get-caller-identity before running Terraform
   - `env/`: environment overrides via `*.tfvars` (`local_dev.tfvars`, `dev.tfvars`, `uat.tfvars`, `prod.tfvars`)
 
 - Modules (`infrastructure/terraform/modules/*`): each module is self-contained with `main.tf`, `variables.tf`, `outputs.tf`.
-  - `vpc/`: creates VPC and public subnets
-    - Inputs: `name`, `cidr_block`, `tags`, `public_subnets`
-    - Outputs: `vpc_id`, `public_subnet_ids`
+- `vpc/`: creates VPC, public and private subnets, NAT gateway, and routes
+  - Inputs: `name`, `cidr_block`, `tags`, `public_subnets`, `private_subnets`
+  - Outputs: `vpc_id`, `public_subnet_ids`, `private_subnet_ids`
   - `s3_data_lake/`: creates Bronze, Silver, Gold, and Code buckets with public access blocked and SSE-S3
     - Inputs: `name_prefix`, `tags`
     - Outputs: bucket IDs for each layer
@@ -57,3 +57,51 @@ Confirm identity: aws sts get-caller-identity before running Terraform
   - `make tf-destroy ENV=uat`
 
 Prerequisites: valid AWS credentials configured (env vars or profile). Bucket names must be globally unique; adjust `name_prefix` per environment/account before apply.
+## Running the Bronze Ingestion Job
+
+Start the Glue Python shell job to download the parquet file from CloudFront and upload it to your Bronze bucket via multipart upload. The job name is provisioned by Terraform from `infrastructure/terraform/modules/glue_job/main.tf` and exposed via the root output `glue_job_name`:
+
+```
+aws glue start-job-run --job-name dev_ingest_into_bronze
+
+Notes:
+- The job command is defined in `infrastructure/terraform/modules/glue_job/main.tf:142-149` with `name = "pythonshell"` and `script_location` pointing to the uploaded script in the Code bucket.
+- Default arguments include metrics and CloudWatch logging as seen in `infrastructure/terraform/modules/glue_job/main.tf:150-157`.
+- Schemas uploaded to the Code bucket set `content_type = "application/json"` (`infrastructure/terraform/modules/glue_job/main.tf:132`).
+- If you hit `ConcurrentRunsExceededException`, list and stop active runs, then retry:
+  aws glue get-job-runs --job-name dev_ingest_into_bronze --max-results 5
+  aws glue batch-stop-job-run --job-name dev_ingest_into_bronze --job-run-ids <ids>
+  aws glue start-job-run --job-name dev_ingest_into_bronze
+```
+
+The job now auto-discovers the Bronze bucket in-region via the AWS SDK; no bucket argument is required.
+
+## Networking Architecture (Glue in Private Subnet)
+
+Glue job ENIs are provisioned in a private subnet. Outbound access to S3 and public APIs flows through a NAT Gateway in a public subnet, then an Internet Gateway to the public internet.
+
+Flow: `Glue job → Private Subnet → NAT Gateway (in public subnet) → Internet Gateway → Public Internet`
+
+Key components:
+- Private subnets: `map_public_ip_on_launch = false`, associated with a private route table
+- NAT Gateway: created in the first public subnet with an Elastic IP
+- Internet Gateway: attached to the VPC, targeted by the public route table
+- Route tables:
+  - Public route table: `0.0.0.0/0` → IGW
+  - Private route table: `0.0.0.0/0` → NAT
+- Security group: self-referencing TCP ingress, egress allows all outbound (`protocol = -1`)
+
+Notes:
+- No S3 VPC endpoint is provisioned; S3 access uses NAT egress.
+
+# Local Development
+- For local development of pyspark use [SQLFrame](https://github.com/eakmanrq/sqlframe) library
+- For tuorial on pyspark use this [tutorial](https://colab.research.google.com/drive/1G894WS7ltIUTusWWmsCnF_zQhQqZCDOc)
+
+# Further Reading
+- [Learning Spark](https://learning.oreilly.com/library/view/learning-spark-2nd/9781492050032)
+- [Glue](https://learning.oreilly.com/library/view/serverless-etl-and/9781800564985/)
+
+# Future Projects
+- Stock market data : https://marketstack.com/pricing with with Data Vault 2.0 modeling in Silver and Kimball dimensional modeling in Gold
+- Use aws s3 endpoint avoiding public internet

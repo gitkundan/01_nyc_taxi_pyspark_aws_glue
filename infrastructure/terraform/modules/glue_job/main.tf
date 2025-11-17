@@ -1,5 +1,5 @@
 resource "aws_iam_role" "glue_role" {
-  name               = "${var.name_prefix}-glue-role"
+  name               = "${var.name_prefix}-${var.component}-glue-role"
   assume_role_policy = data.aws_iam_policy_document.glue_trust.json
   tags               = var.tags
 }
@@ -14,88 +14,116 @@ data "aws_iam_policy_document" "glue_trust" {
   }
 }
 
-# Optional: attach AWS managed policy for full S3 access
-resource "aws_iam_role_policy_attachment" "glue_s3_full_access" {
-  role       = aws_iam_role.glue_role.name
-  policy_arn = "arn:aws:iam::aws:policy/AmazonS3FullAccess"
-}
+## Removed AmazonS3FullAccess; rely on AWSGlueServiceRole and bucket policies/least privilege
 
 resource "aws_iam_role_policy_attachment" "glue_service_role" {
   role       = aws_iam_role.glue_role.name
   policy_arn = "arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole"
 }
 
+data "aws_iam_policy_document" "s3_access" {
+  statement {
+    actions = ["s3:GetObject"]
+    resources = [
+      "arn:aws:s3:::${var.code_bucket_name}/glue/scripts/*",
+      "arn:aws:s3:::${var.code_bucket_name}/glue/schemas/*",
+    ]
+  }
+
+  statement {
+    actions = ["s3:PutObject"]
+    resources = [
+      "arn:aws:s3:::${var.bronze_bucket_name}/*",
+    ]
+  }
+  statement {
+    actions   = ["s3:ListAllMyBuckets"]
+    resources = ["*"]
+  }
+  statement {
+    actions   = ["s3:GetBucketLocation"]
+    resources = ["arn:aws:s3:::*"]
+  }
+}
+
+resource "aws_iam_policy" "s3_access" {
+  name   = "${var.name_prefix}-${var.component}-glue-s3"
+  policy = data.aws_iam_policy_document.s3_access.json
+}
+
+resource "aws_iam_role_policy_attachment" "glue_s3_access" {
+  role       = aws_iam_role.glue_role.name
+  policy_arn = aws_iam_policy.s3_access.arn
+}
+
 # Network: run Glue inside VPC subnet via a Glue connection
 resource "aws_security_group" "glue_job" {
-  name        = "${var.name_prefix}-glue-sg"
+  name        = "${var.name_prefix}-${var.component}-glue-sg"
   description = "Security group for Glue job network access"
   vpc_id      = var.vpc_id
   ingress {
     from_port = 0
-    to_port   = 0
-    protocol  = "-1"
+    to_port   = 65535
+    protocol  = "tcp"
     self      = true
   }
   egress {
     from_port   = 0
     to_port     = 0
     protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
+    cidr_blocks = [var.egress_cidr_block]
   }
   tags = var.tags
 }
+
 
 data "aws_subnet" "selected" {
   id = var.subnet_id
 }
 
 resource "aws_glue_connection" "vpc" {
-  name            = "${var.name_prefix}-glue-vpc"
+  name            = "${var.name_prefix}-${var.component}-glue-vpc"
   connection_type = "NETWORK"
-  connection_properties = {
-    JDBC_ENFORCE_SSL = "false"
-  }
   physical_connection_requirements {
     availability_zone      = data.aws_subnet.selected.availability_zone
     subnet_id              = var.subnet_id
     security_group_id_list = [aws_security_group.glue_job.id]
   }
-  depends_on = [aws_security_group.glue_job]
 }
 
-# Upload the local Python script to the code bucket
-resource "aws_s3_object" "bronze_script" {
+locals {
+  scripts = fileset(var.scripts_source_dir, "**/*.py")
+}
+
+resource "aws_s3_object" "glue_scripts" {
+  for_each     = toset(local.scripts)
   bucket       = var.code_bucket_name
-  key          = var.script_s3_key
-  source       = var.script_source_path
+  key          = "${var.scripts_dest_prefix}/${each.value}"
+  source       = "${var.scripts_source_dir}/${each.value}"
   content_type = "text/x-python"
-  etag         = filemd5(var.script_source_path)
+  etag         = filemd5("${var.scripts_source_dir}/${each.value}")
 }
 
-resource "aws_glue_job" "bronze" {
-  name        = "${var.name_prefix}-bronze"
+
+
+# Glue job: 01_get_nyc_taxi_data (manual-run)
+resource "aws_glue_job" "this" {
+  name        = var.job_name
   role_arn    = aws_iam_role.glue_role.arn
   connections = [aws_glue_connection.vpc.name]
   command {
-    name            = "glueetl"
-    python_version  = "3"
-    script_location = "s3://${var.code_bucket_name}/${var.script_s3_key}"
+    name            = "pythonshell"
+    script_location = "s3://${var.code_bucket_name}/${var.job_script_s3_key}"
+    python_version  = var.python_shell_version
   }
-  glue_version      = "5.0"
-  number_of_workers = 2
-  worker_type       = "G.1X"
-  default_arguments = {
-    "--enable-job-insights" = "true"
-    "--enable-metrics"      = "true"
-    "--enable-continuous-cloudwatch-log" = "true"
-    "--job-bookmark-option"              = "job-bookmark-enable"
-    "--BRONZE_BUCKET"       = var.bronze_bucket_name
-    "--SILVER_BUCKET"       = var.silver_bucket_name
-    "--INPUT_KEY"           = var.input_key
-    "--OUTPUT_PREFIX"       = var.output_prefix
-    "--DB_NAME"             = var.db_name
-    "--TABLE_NAME"          = var.table_name
-  }
+  max_capacity = 1
+  default_arguments = merge(
+    {
+      "--enable-metrics"                   = "true",
+      "--enable-continuous-cloudwatch-log" = "true",
+    },
+    var.job_default_arguments
+  )
   tags       = var.tags
-  depends_on = [aws_s3_object.bronze_script]
+  depends_on = [aws_s3_object.glue_scripts]
 }

@@ -3,8 +3,8 @@ output "silver_bucket" { value = module.s3_data_lake.silver_bucket }
 output "gold_bucket" { value = module.s3_data_lake.gold_bucket }
 output "code_bucket" { value = module.s3_data_lake.code_bucket }
 
-output "glue_role_arn" { value = module.glue_job.glue_role_arn }
-output "bronze_job_name" { value = module.glue_job.bronze_job_name }
+output "glue_role_arn" { value = module.glue_bronze_job.glue_role_arn }
+output "glue_job_name" { value = module.glue_bronze_job.job_name }
 
 output "glue_database" { value = module.glue_catalog.database_name }
 

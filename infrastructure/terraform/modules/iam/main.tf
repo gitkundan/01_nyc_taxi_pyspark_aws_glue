@@ -1,5 +1,3 @@
-data "aws_caller_identity" "current" {}
-
 resource "aws_iam_role" "github_oidc" {
   name               = "${var.name_prefix}-gha-oidc"
   assume_role_policy = data.aws_iam_policy_document.gha_trust.json
@@ -11,7 +9,7 @@ data "aws_iam_policy_document" "gha_trust" {
     actions = ["sts:AssumeRoleWithWebIdentity"]
     principals {
       type        = "Federated"
-      identifiers = ["arn:aws:iam::${data.aws_caller_identity.current.account_id}:oidc-provider/token.actions.githubusercontent.com"]
+      identifiers = ["arn:aws:iam::${var.aws_account_id}:oidc-provider/token.actions.githubusercontent.com"]
     }
     condition {
       test     = "StringEquals"

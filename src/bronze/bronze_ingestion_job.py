@@ -1,120 +1,118 @@
-import sys
+import boto3
 import logging
-from awsglue.context import GlueContext
-from awsglue.job import Job
-from awsglue.utils import getResolvedOptions
-from awsglue.dynamicframe import DynamicFrame
-from pyspark.sql import SparkSession
-from pyspark.sql.types import StructType, StructField, StringType
-from pyspark.sql.functions import col, trim, upper, length, regexp_extract
+import requests
+import time
+from typing import Optional
 
-logger = logging.getLogger("bronze_ingestion")
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+logger = logging.getLogger(__name__)
 
-args = getResolvedOptions(sys.argv, [
-    "JOB_NAME",
-    "BRONZE_BUCKET",
-    "SILVER_BUCKET",
-    "INPUT_KEY",
-    "OUTPUT_PREFIX",
-    "DB_NAME",
-    "TABLE_NAME",
-])
+def _find_bronze_bucket(region: str) -> str:
+    s3 = boto3.client("s3")
+    buckets = s3.list_buckets().get("Buckets", [])
+    for b in buckets:
+        name = b["Name"]
+        loc = boto3.client("s3").get_bucket_location(Bucket=name).get("LocationConstraint")
+        bucket_region = loc or "us-east-1"
+        if bucket_region == region and name.endswith("-bronze"):
+            return name
+    raise RuntimeError("No bronze bucket found in region")
 
-spark = SparkSession.builder.appName(args["JOB_NAME"]).getOrCreate()
-glue = GlueContext(spark)
-job = Job(glue)
-job.init(args["JOB_NAME"], args)
 
-schema = StructType([
-    StructField("country_code", StringType(), False),
-    StructField("country_name", StringType(), True),
-    StructField("currency_code", StringType(), False),
-    StructField("currency_name", StringType(), True),
-])
+class S3ChunkedDownloader:
+    def __init__(self, source_url: str, s3_bucket: str, output_key: str, chunk_size: int = 10 * 1024 * 1024, aws_region: Optional[str] = None) -> None:
+        self.source_url = source_url
+        self.s3_bucket = s3_bucket
+        self.output_key = output_key
+        self.chunk_size = chunk_size
+        self.s3_client = boto3.client("s3", region_name=aws_region)
+        self.multipart_upload = None
+        self.parts = []
+        self.total_size: Optional[int] = None
+        self.uploaded_bytes: int = 0
+        logger.info(
+            f"Initialized downloader bucket={self.s3_bucket} key={self.output_key} region={aws_region} chunk_size={self.chunk_size}"
+        )
 
-src_path = f"s3://{args['BRONZE_BUCKET']}/{args['INPUT_KEY']}"
-dst_path = f"s3://{args['SILVER_BUCKET']}/{args['OUTPUT_PREFIX']}"
-invalid_dst_path = f"s3://{args['BRONZE_BUCKET']}/seeds/country_code_currency_mapping_invalid/"
+    def download_and_upload(self) -> None:
+        overall_start = time.time()
+        try:
+            self._initialize_multipart_upload()
+            self._process_stream()
+            self._complete_multipart_upload()
+            overall_elapsed_ms = int((time.time() - overall_start) * 1000)
+            logger.info(
+                f"Upload completed parts={len(self.parts)} bytes={self.uploaded_bytes} duration_ms={overall_elapsed_ms}"
+            )
+        except Exception as e:
+            logger.error(f"Operation failed: {e}")
+            if self.multipart_upload:
+                self.s3_client.abort_multipart_upload(Bucket=self.s3_bucket, Key=self.output_key, UploadId=self.multipart_upload["UploadId"])
+            raise
 
-df = (
-    spark.read.schema(schema)
-    .option("header", "true")
-    .csv(src_path)
-)
+    def _initialize_multipart_upload(self) -> None:
+        self.multipart_upload = self.s3_client.create_multipart_upload(Bucket=self.s3_bucket, Key=self.output_key)
+        logger.info(
+            f"Initialized multipart upload upload_id={self.multipart_upload['UploadId']} bucket={self.s3_bucket} key={self.output_key}"
+        )
 
-total = df.count()
-logger.info("read_rows=%d src=%s", total, src_path)
+    def _process_stream(self) -> None:
+        with requests.Session() as session:
+            connect_start = time.time()
+            response = session.get(self.source_url, stream=True)
+            connect_elapsed_ms = int((time.time() - connect_start) * 1000)
+            logger.info(
+                f"Source connection established url={self.source_url} status_code={response.status_code} connect_ms={connect_elapsed_ms}"
+            )
+            response.raise_for_status()
+            content_length = response.headers.get("Content-Length")
+            self.total_size = int(content_length) if content_length else None
+            logger.info(
+                f"Content length bytes={self.total_size if self.total_size is not None else 'unknown'}"
+            )
+            part_number = 1
+            for chunk in response.iter_content(chunk_size=self.chunk_size):
+                if chunk:
+                    part_start = time.time()
+                    self._upload_part(part_number, chunk)
+                    part_elapsed_ms = int((time.time() - part_start) * 1000)
+                    chunk_size_bytes = len(chunk)
+                    self.uploaded_bytes += chunk_size_bytes
+                    if self.total_size:
+                        pct = (self.uploaded_bytes / self.total_size) * 100
+                        logger.info(
+                            f"Part uploaded part_number={part_number} size_bytes={chunk_size_bytes} elapsed_ms={part_elapsed_ms} progress={self.uploaded_bytes}/{self.total_size} ({pct:.2f}%)"
+                        )
+                    else:
+                        logger.info(
+                            f"Part uploaded part_number={part_number} size_bytes={chunk_size_bytes} elapsed_ms={part_elapsed_ms} progress_bytes={self.uploaded_bytes}"
+                        )
+                    part_number += 1
 
-clean = (
-    df.select(
-        trim(col("country_code")).alias("country_code"),
-        trim(col("country_name")).alias("country_name"),
-        upper(trim(col("currency_code"))).alias("currency_code"),
-        trim(col("currency_name")).alias("currency_name"),
+    def _upload_part(self, part_number: int, chunk: bytes) -> None:
+        response = self.s3_client.upload_part(Body=chunk, Bucket=self.s3_bucket, Key=self.output_key, UploadId=self.multipart_upload["UploadId"], PartNumber=part_number)
+        self.parts.append({"PartNumber": part_number, "ETag": response["ETag"]})
+        logger.info(
+            f"Upload part acknowledged part_number={part_number} etag={response['ETag']}"
+        )
+
+    def _complete_multipart_upload(self) -> None:
+        self.s3_client.complete_multipart_upload(Bucket=self.s3_bucket, Key=self.output_key, UploadId=self.multipart_upload["UploadId"], MultipartUpload={"Parts": self.parts})
+        logger.info("Completed multi-part upload")
+
+
+def main() -> None:
+    source_url = "https://d37ci6vzurychx.cloudfront.net/trip-data/yellow_tripdata_2023-01.parquet"
+    object_key = source_url.split("/")[-1]
+    bronze_bucket = _find_bronze_bucket("us-east-1")
+    downloader = S3ChunkedDownloader(
+        source_url=source_url,
+        s3_bucket=bronze_bucket,
+        output_key=object_key,
+        chunk_size=10 * 1024 * 1024,
+        aws_region="us-east-1",
     )
-)
+    downloader.download_and_upload()
 
-valid_cc = regexp_extract(col("country_code"), r"^[A-Za-z]{2,3}$", 0) != ""
-valid_cur = regexp_extract(col("currency_code"), r"^[A-Z]{3}$", 0) != ""
-is_valid = valid_cc & valid_cur
-
-valid_df = clean.filter(is_valid)
-invalid_df = clean.filter(~is_valid)
-
-valid = valid_df.count()
-invalid = invalid_df.count()
-logger.info("valid_rows=%d invalid_rows=%d", valid, invalid)
-
-valid_df.write.mode("overwrite").parquet(dst_path)
-logger.info("wrote_rows=%d dst=%s", valid, dst_path)
-
-# Write invalid rows to quarantine in Bronze
-invalid_df.write.mode("overwrite").parquet(invalid_dst_path)
-logger.info("quarantined_rows=%d dst=%s", invalid, invalid_dst_path)
-
-# Update Glue Catalog: valid table
-from awsglue.dynamicframe import DynamicFrame
-valid_dyn = DynamicFrame.fromDF(valid_df, glue, "valid_country_currency")
-valid_sink = glue.getSink(
-    path=dst_path,
-    connection_type="s3",
-    updateBehavior="LOG",
-    enableUpdateCatalog=True,
-    partitionKeys=[],
-)
-valid_sink.setCatalogInfo(catalogDatabase=args["DB_NAME"], catalogTableName=args["TABLE_NAME"])
-valid_sink.setFormat("glueparquet")
-valid_sink.writeFrame(valid_dyn)
-
-# Update Glue Catalog: invalid table (optional)
-invalid_dyn = DynamicFrame.fromDF(invalid_df, glue, "invalid_country_currency")
-invalid_sink = glue.getSink(
-    path=invalid_dst_path,
-    connection_type="s3",
-    updateBehavior="LOG",
-    enableUpdateCatalog=True,
-    partitionKeys=[],
-)
-invalid_sink.setCatalogInfo(catalogDatabase=args["DB_NAME"], catalogTableName=f"{args['TABLE_NAME']}_invalid")
-invalid_sink.setFormat("glueparquet")
-invalid_sink.writeFrame(invalid_dyn)
-
-# Create/Update Glue Catalog table via DynamicFrame write
-dyn = DynamicFrame.fromDF(valid_df, glue, "country_currency")
-glue_context = glue
-glue_context.write_dynamic_frame.from_options(
-    frame=dyn,
-    connection_type="s3",
-    connection_options={
-        "path": dst_path,
-        "partitionKeys": []
-    },
-    format="glueparquet",
-    format_options={
-        "compression": "snappy"
-    },
-    transformation_ctx="write_to_silver"
-)
-
-job.commit()
+if __name__ == "__main__":
+    main()

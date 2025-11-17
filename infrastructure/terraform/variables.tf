@@ -38,6 +38,14 @@ variable "vpc_public_subnets" {
   ]
 }
 
+variable "vpc_private_subnets" {
+  type = list(string)
+  default = [
+    "10.0.101.0/24",
+    "10.0.102.0/24"
+  ]
+}
+
 ## Glue Catalog
 variable "database_name" {
   type    = string
@@ -60,20 +68,7 @@ variable "bronze_columns" {
 }
 
 ## Glue Job
-variable "data_bucket_prefix" {
-  type    = string
-  default = "nyc-taxi-data"
-}
 
-variable "code_bucket_prefix" {
-  type    = string
-  default = "nyc-taxi-code"
-}
-
-variable "script_location_bronze" {
-  type    = string
-  default = "s3://nyc-taxi-code/glue/scripts/bronze.py"
-}
 
 ## IAM
 variable "oidc_subject" {
@@ -81,22 +76,21 @@ variable "oidc_subject" {
   default = "repo:your_org/your_repo:ref:refs/heads/*"
 }
 
+variable "aws_account_id" {
+  type = string
+}
+
 ############################################
 # Phase 2 variables (commented out)
 ############################################
 
-## Glue DQ (phase 2)
-variable "bronze_ruleset_path" { type = string }
 
-# ## Step Functions (phase 2)
-# variable "sfn_role_arn" { type = string }
-# variable "step_functions_definition_path" { type = string }
 
-# ## EventBridge (phase 2)
-# variable "cron" { type = string }
 
-# ## CloudWatch Logs (phase 2)
-# variable "retention_days" { type = number }
+
+
+
+
 
 ## Athena
 variable "athena_output_location" {
@@ -104,9 +98,10 @@ variable "athena_output_location" {
   default = "s3://nyc-taxi-code/athena-results/"
 }
 
-# ## Lambda (phase 2)
-# variable "lambda_role_arn" { type = string }
-# variable "lambda_handler" { type = string }
-# variable "lambda_runtime" { type = string }
-# variable "lambda_package_path" { type = string }
-# variable "lambda_env" { type = map(string) }
+
+
+## Glue job naming
+variable "job_name_prefix" {
+  type    = string
+  default = "dev"
+}
