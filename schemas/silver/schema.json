@@ -1,0 +1,11 @@
+{
+  "columns": [
+    { "name": "vendor_id", "type": "string" },
+    { "name": "pickup_datetime", "type": "timestamp" },
+    { "name": "dropoff_datetime", "type": "timestamp" },
+    { "name": "passenger_count", "type": "int" },
+    { "name": "year", "type": "int" },
+    { "name": "month", "type": "int" },
+    { "name": "day", "type": "int" }
+  ]
+}
